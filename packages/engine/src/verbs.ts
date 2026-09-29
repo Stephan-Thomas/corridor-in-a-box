@@ -60,6 +60,20 @@ export async function open(
   return adapter.openTransaction(intent, q, corridor);
 }
 
+export function buildSettlementRequest(
+  opened: OpenTransaction,
+  q: Quote,
+  corridor: Corridor,
+): SettlementRequest {
+  return {
+    to: opened.depositAddress,
+    memo: opened.memo,
+    memoType: opened.memoType,
+    amount: { asset: corridor.settlement.bridge_asset, amount: q.sourceAmount.amount },
+    corridor,
+  };
+}
+
 // 3b. SETTLE — the native on-chain payment of the bridge asset to the anchor.
 export async function settle(
   submitter: SettlementSubmitter,
@@ -67,13 +81,7 @@ export async function settle(
   q: Quote,
   corridor: Corridor,
 ): Promise<Outcome<SettlementRef>> {
-  const req: SettlementRequest = {
-    to: opened.depositAddress,
-    memo: opened.memo,
-    memoType: opened.memoType,
-    amount: { asset: corridor.settlement.bridge_asset, amount: q.sourceAmount.amount },
-    corridor,
-  };
+  const req = buildSettlementRequest(opened, q, corridor);
   return submitter.submit(req);
 }
 

@@ -12,6 +12,7 @@
   "dependencies": {
     "@corridor/types": "workspace:*",
     "@corridor/manifest": "workspace:*",
-    "@corridor/adapter-kit": "workspace:*"
+    "@corridor/adapter-kit": "workspace:*",
+    "@corridor/engine": "workspace:*"
   }
 }

@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { parseCorridor, type Corridor } from "@corridor/manifest";
-import { Sep31Adapter, mapSep31Status, parseRefunds, type Sep10Signer } from "@corridor/sep31";
+import {
+  Sep31Adapter,
+  mapSep31Status,
+  parseRefunds,
+  amountRangeCheck,
+  type Sep10Signer,
+} from "@corridor/sep31";
+import type { GateContext } from "@corridor/engine";
+import type { Quote, OpenTransaction } from "@corridor/adapter-kit";
 import type { PaymentIntent } from "@corridor/types";
 
 const PASSPHRASE = "Test SDF Network ; September 2015";
@@ -55,6 +63,7 @@ function fakeFetch(routes: Record<string, FakeResponse>) {
 function corridor(
   endpoints: Record<string, string>,
   settlement: Record<string, string> = {},
+  limits?: { min_amount?: string; max_amount?: string },
 ): Corridor {
   const r = parseCorridor({
     id: "test",
@@ -68,6 +77,7 @@ function corridor(
     compliance: { source_jurisdiction: "AR", dest_jurisdiction: "AR" },
     settlement: { network: "public", asset_issuer: "GISSUER", ...settlement },
     recovery: {},
+    limits,
   });
   if (!r.ok) throw new Error("fixture invalid");
   return r.value;
@@ -534,5 +544,98 @@ describe("refund initiation (deliberately unsupported)", () => {
     }
     // Fail-closed means CLOSED: no bespoke HTTP call dressed up as SEP-31.
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe("amountRangeCheck", () => {
+  it("refused at verifying when anchor bumps sell_amount above max_amount", async () => {
+    const c = corridor(
+      { transfer_server_sep31: "https://d.example/sep31" },
+      {},
+      { max_amount: "100" },
+    );
+
+    // The amount we requested was "100", but the quote (sell_amount) was bumped to "101"
+    const intent: PaymentIntent = {
+      idempotencyKey: "k1",
+      corridorId: "c1",
+      sender: { id: "s1" },
+      recipient: { id: "r1" },
+      sourceAmount: { asset: "USDC", amount: "100" },
+    };
+
+    const quote: Quote = {
+      id: "q1",
+      price: "1",
+      expiresAt: Date.now() + 1000,
+      sourceAmount: { asset: "USDC", amount: "101" }, // Anchor bumped it
+      destAmount: { asset: "ARS", amount: "101" },
+      firm: true,
+    };
+
+    const opened: OpenTransaction = {
+      transactionId: "tx-1",
+      depositAddress: "ADDRESS",
+    };
+
+    const ctx: GateContext = {
+      intent,
+      corridor: c,
+      quote,
+      opened,
+      now: Date.now(),
+      attempt: 1,
+    };
+
+    const { fn } = fakeFetch({
+      "GET /sep31/info": res({
+        receive: { [c.dest.asset]: { min_amount: 1, max_amount: 500 } },
+      }),
+    });
+
+    const check = amountRangeCheck({ fetchImpl: fn as typeof fetch });
+    const result = await check.run(ctx);
+
+    expect(result.passed).toBe(false);
+    expect(result.code).toBe("PRESETTLE_AMOUNT_OUT_OF_RANGE");
+    expect(result.detail).toContain("exceeds maximum");
+  });
+
+  it("below anchor min, above anchor max, missing /info bounds -> only manifest bounds apply", async () => {
+    const c = corridor(
+      { transfer_server_sep31: "https://d.example/sep31" },
+      {},
+      { min_amount: "10", max_amount: "100" },
+    );
+
+    const quote: Quote = {
+      id: "q1",
+      price: "1",
+      expiresAt: Date.now() + 1000,
+      sourceAmount: { asset: "USDC", amount: "101" },
+      destAmount: { asset: "ARS", amount: "101" },
+      firm: true,
+    };
+
+    const ctx: GateContext = {
+      intent: {} as PaymentIntent,
+      corridor: c,
+      quote,
+      opened: { depositAddress: "ADDRESS", transactionId: "tx-1" },
+      now: Date.now(),
+      attempt: 1,
+    };
+
+    // Missing info bounds
+    const { fn } = fakeFetch({
+      "GET /sep31/info": res({ receive: { [c.dest.asset]: {} } }),
+    });
+
+    const check = amountRangeCheck({ fetchImpl: fn as typeof fetch });
+    const result = await check.run(ctx);
+
+    expect(result.passed).toBe(false);
+    expect(result.code).toBe("PRESETTLE_AMOUNT_OUT_OF_RANGE");
+    expect(result.detail).toContain("exceeds maximum 100");
   });
 });

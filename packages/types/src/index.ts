@@ -31,7 +31,8 @@ export type CorridorErrorCode =
   | "RECONCILE_STALLED"
   | "IDEMPOTENCY_CONFLICT"
   /** our balance cannot cover amount + fee + reserve */
-  | "PRESETTLE_INSUFFICIENT_FUNDS";
+  | "PRESETTLE_INSUFFICIENT_FUNDS"
+  | "PRESETTLE_AMOUNT_OUT_OF_RANGE";
 
 /**
  * Returns true if the error code is a pre-settle gate check refusal.

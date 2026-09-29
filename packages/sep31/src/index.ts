@@ -35,6 +35,12 @@ import type {
   RefundRef,
   TransactionStatus,
 } from "@corridor/adapter-kit";
+import {
+  type CheckResult,
+  type GateCheck,
+  type GateContext,
+  buildSettlementRequest,
+} from "@corridor/engine";
 
 type FetchLike = typeof fetch;
 
@@ -727,4 +733,99 @@ export class Sep31Adapter implements AnchorAdapter {
       { retryable: false },
     );
   }
+}
+
+export function amountRangeCheck(opts: { fetchImpl?: typeof fetch } = {}): GateCheck {
+  return {
+    name: "amount.range",
+    async run(ctx: GateContext): Promise<CheckResult> {
+      const start = Date.now();
+      const req = buildSettlementRequest(ctx.opened, ctx.quote, ctx.corridor);
+      const amount = req.amount.amount;
+      const corridor = ctx.corridor;
+      const fetchImpl = opts.fetchImpl ?? fetch;
+
+      const toError = (
+        detail: string,
+        code: string = "PRESETTLE_AMOUNT_OUT_OF_RANGE",
+      ): CheckResult => ({
+        name: "amount.range",
+        passed: false,
+        code: code as unknown as import("@corridor/types").CorridorErrorCode,
+        detail,
+        durationMs: Date.now() - start,
+      });
+
+      let infoMin: string | undefined;
+      let infoMax: string | undefined;
+
+      try {
+        const sep31Endpoint = corridor.dest.endpoints.transfer_server_sep31;
+        if (!sep31Endpoint) {
+          return toError("manifest missing sep31 endpoint", "SETTLEMENT_FAILED");
+        }
+        const res = await fetchImpl(`${sep31Endpoint}/info`);
+        if (!res.ok) {
+          return toError(`HTTP ${res.status} fetching /info`, "SETTLEMENT_FAILED");
+        }
+        const j = (await res.json()) as {
+          receive?: Record<
+            string,
+            { min_amount?: string | number; max_amount?: string | number }
+          >;
+        };
+        const assetObj = j.receive?.[corridor.dest.asset];
+        if (assetObj) {
+          infoMin =
+            typeof assetObj.min_amount === "number"
+              ? String(assetObj.min_amount)
+              : assetObj.min_amount;
+          infoMax =
+            typeof assetObj.max_amount === "number"
+              ? String(assetObj.max_amount)
+              : assetObj.max_amount;
+        }
+      } catch (err) {
+        return toError(
+          `failed fetching /info: ${(err as Error).message}`,
+          "SETTLEMENT_FAILED",
+        );
+      }
+
+      const manMin = corridor.limits?.min_amount;
+      let effectiveMin = manMin || infoMin;
+      if (manMin && infoMin) {
+        const cmp = compareAmounts(manMin, infoMin);
+        effectiveMin = cmp.ok && cmp.value > 0 ? manMin : infoMin;
+      }
+
+      if (effectiveMin) {
+        const cmp = compareAmounts(amount, effectiveMin);
+        if (cmp.ok && cmp.value < 0) {
+          return toError(`amount ${amount} is below minimum ${effectiveMin}`);
+        }
+      }
+
+      const manMax = corridor.limits?.max_amount;
+      let effectiveMax = manMax || infoMax;
+      if (manMax && infoMax) {
+        const cmp = compareAmounts(manMax, infoMax);
+        effectiveMax = cmp.ok && cmp.value < 0 ? manMax : infoMax;
+      }
+
+      if (effectiveMax) {
+        const cmp = compareAmounts(amount, effectiveMax);
+        if (cmp.ok && cmp.value > 0) {
+          return toError(`amount ${amount} exceeds maximum ${effectiveMax}`);
+        }
+      }
+
+      return {
+        name: "amount.range",
+        passed: true,
+        detail: "amount is within limits",
+        durationMs: Date.now() - start,
+      };
+    },
+  };
 }
