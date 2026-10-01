@@ -31,6 +31,7 @@ export {
   buildSettlementRequest,
   reconcile,
   reconcileUntil,
+  anchorTerminalStatus,
   backoffMs,
   recover,
   type RecoveryAction,

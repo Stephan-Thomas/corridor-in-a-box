@@ -60,6 +60,11 @@ export async function open(
   return adapter.openTransaction(intent, q, corridor);
 }
 
+/**
+ * The exact settlement request `settle()` submits, factored out (#148) so the
+ * `anchor.tx.match` gate check verifies the very request that will be built —
+ * not a parallel reconstruction that could drift from it.
+ */
 export function buildSettlementRequest(
   opened: OpenTransaction,
   q: Quote,
@@ -81,8 +86,7 @@ export async function settle(
   q: Quote,
   corridor: Corridor,
 ): Promise<Outcome<SettlementRef>> {
-  const req = buildSettlementRequest(opened, q, corridor);
-  return submitter.submit(req);
+  return submitter.submit(buildSettlementRequest(opened, q, corridor));
 }
 
 // 4. RECONCILE — match the on-chain leg against the anchor's view of the payout.
@@ -193,7 +197,9 @@ export async function reconcileUntil(
       return fail(
         "RECONCILE_MISMATCH",
         `tx ${transactionId} terminally failed at anchor (status=${s.value.status})`,
-        { retryable: false },
+        // The full terminal status rides along so the engine can read `status`
+        // and `refunds` without a second poll. See `anchorTerminalStatus`.
+        { retryable: false, cause: s.value },
       );
     }
     if (threshold > 0 && sameCount >= threshold) {
@@ -218,6 +224,21 @@ export async function reconcileUntil(
     }
     await opts.sleep(opts.pollMs);
   }
+}
+
+/**
+ * The anchor's terminal `TransactionStatus`, when `reconcileUntil` failed because
+ * the anchor reported a terminal non-success state (carried on the error's
+ * `cause`). Undefined for every other failure (timeout, stall, transport).
+ */
+export function anchorTerminalStatus(e: { cause?: unknown }): TransactionStatus | undefined {
+  const c = e.cause as Partial<TransactionStatus> | undefined;
+  return c &&
+    typeof c === "object" &&
+    c.terminalFailure === true &&
+    typeof c.status === "string"
+    ? (c as TransactionStatus)
+    : undefined;
 }
 
 /** Exponential backoff with a cap, used between settlement retries. */

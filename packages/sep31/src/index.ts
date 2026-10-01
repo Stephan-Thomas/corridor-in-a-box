@@ -35,12 +35,7 @@ import type {
   RefundRef,
   TransactionStatus,
 } from "@corridor/adapter-kit";
-import {
-  type CheckResult,
-  type GateCheck,
-  type GateContext,
-  buildSettlementRequest,
-} from "@corridor/engine";
+import type { CheckResult, GateCheck, GateContext } from "@corridor/engine";
 
 type FetchLike = typeof fetch;
 
@@ -714,11 +709,12 @@ export class Sep31Adapter implements AnchorAdapter {
   // network. Learning that a refund *happened* is `getTransaction`'s job (the
   // anchor flips the transaction's status once it refunds).
   //
-  // Nothing calls this yet: whether refund initiation belongs on the
-  // AnchorAdapter port at all is a separate design decision. The method exists
-  // to occupy the name with the refusal — the engine already parks any refused
-  // refund in `held` for a human (the out-of-band path in docs/operations.md),
-  // and that is asserted at the engine seam in tests/engine.test.ts.
+  // Since #72, `requestRefund` is part of the `AnchorAdapter` port. The
+  // generic `Sep31Adapter` fails closed with `REFUND_UNSUPPORTED` — standard
+  // SEP-31 anchors have no sender-initiated refund endpoint. The engine does
+  // not call it yet, and the state machine defines `refund_pending` but no
+  // transition enters it. The method occupies the name so bespoke adapters
+  // (OTC desks, proprietary anchors) can implement anchor-driven refunds.
   async requestRefund(
     transactionId: string,
     _amount?: Money,
@@ -733,99 +729,157 @@ export class Sep31Adapter implements AnchorAdapter {
       { retryable: false },
     );
   }
+
+  /**
+   * Re-read the receiving anchor's SEP-31 /info directly.
+   *
+   * Authenticated via SEP-10 if configured. Kept OFF the generic AnchorAdapter
+   * port because /info is SEP-31 specific.
+   */
+  async getInfo(): Promise<Outcome<Sep31Info>> {
+    const sep31 = this.anchor.endpoints.transfer_server_sep31;
+    if (!sep31) {
+      return fail("ANCHOR_UNAVAILABLE", `${this.name}: no SEP-31 transfer server configured`);
+    }
+    const auth = await this.authToken();
+    if (!auth.ok) return auth;
+    try {
+      const res = await this.fetchImpl(`${sep31}/info`, {
+        method: "GET",
+        headers: this.authHeader(auth.value),
+      });
+      if (!res.ok) {
+        return fail("ANCHOR_UNAVAILABLE", `${this.name}: get-info HTTP ${res.status}`, {
+          retryable: res.status >= 500,
+        });
+      }
+      const j = (await res.json()) as {
+        receive?: Record<string, unknown>;
+      };
+      if (!j || typeof j !== "object" || !j.receive || typeof j.receive !== "object") {
+        return ok<Sep31Info>({ receive: {} });
+      }
+      const receive: Record<string, Sep31AssetInfo> = {};
+      for (const [assetCode, rawAsset] of Object.entries(j.receive)) {
+        if (!rawAsset || typeof rawAsset !== "object") continue;
+        const a = rawAsset as Record<string, unknown>;
+        const assetInfo: Sep31AssetInfo = {
+          enabled: typeof a.enabled === "boolean" ? a.enabled : undefined,
+          minAmount: amountString(a.min_amount),
+          maxAmount: amountString(a.max_amount),
+          feeFixed: amountString(a.fee_fixed),
+          feePercent: amountString(a.fee_percent),
+          senderSep12Type:
+            typeof a.sender_sep12_type === "string" ? a.sender_sep12_type : undefined,
+          receiverSep12Type:
+            typeof a.receiver_sep12_type === "string" ? a.receiver_sep12_type : undefined,
+          fields:
+            a.fields && typeof a.fields === "object"
+              ? (a.fields as Record<string, unknown>)
+              : undefined,
+        };
+        receive[assetCode] = assetInfo;
+      }
+      return ok<Sep31Info>({ receive });
+    } catch (cause) {
+      return fail("ANCHOR_UNAVAILABLE", `${this.name}: get-info request failed`, {
+        retryable: true,
+        cause,
+      });
+    }
+  }
 }
 
-export function amountRangeCheck(opts: { fetchImpl?: typeof fetch } = {}): GateCheck {
+export interface Sep31AssetInfo {
+  readonly enabled?: boolean;
+  readonly minAmount?: string;
+  readonly maxAmount?: string;
+  readonly feeFixed?: string;
+  readonly feePercent?: string;
+  readonly senderSep12Type?: string;
+  readonly receiverSep12Type?: string;
+  readonly fields?: Record<string, unknown>;
+}
+
+export interface Sep31Info {
+  readonly receive: Record<string, Sep31AssetInfo>;
+}
+
+export interface Sep31InfoCheckResult extends CheckResult {
+  readonly info?: Sep31Info;
+}
+
+/**
+ * Gate check that verifies the receiving anchor's live SEP-31 /info still lists
+ * and enables the corridor's bridge asset immediately before settlement.
+ */
+export function sep31InfoCheck(adapter: Sep31Adapter): GateCheck {
   return {
-    name: "amount.range",
-    async run(ctx: GateContext): Promise<CheckResult> {
+    name: "sep31.info.asset",
+    async run(ctx: GateContext): Promise<Sep31InfoCheckResult> {
       const start = Date.now();
-      const req = buildSettlementRequest(ctx.opened, ctx.quote, ctx.corridor);
-      const amount = req.amount.amount;
-      const corridor = ctx.corridor;
-      const fetchImpl = opts.fetchImpl ?? fetch;
+      const bridgeAsset = ctx.corridor.settlement.bridge_asset;
+      const infoOutcome = await adapter.getInfo();
 
-      const toError = (
-        detail: string,
-        code: string = "PRESETTLE_AMOUNT_OUT_OF_RANGE",
-      ): CheckResult => ({
-        name: "amount.range",
-        passed: false,
-        code: code as unknown as import("@corridor/types").CorridorErrorCode,
-        detail,
-        durationMs: Date.now() - start,
-      });
-
-      let infoMin: string | undefined;
-      let infoMax: string | undefined;
-
-      try {
-        const sep31Endpoint = corridor.dest.endpoints.transfer_server_sep31;
-        if (!sep31Endpoint) {
-          return toError("manifest missing sep31 endpoint", "SETTLEMENT_FAILED");
-        }
-        const res = await fetchImpl(`${sep31Endpoint}/info`);
-        if (!res.ok) {
-          return toError(`HTTP ${res.status} fetching /info`, "SETTLEMENT_FAILED");
-        }
-        const j = (await res.json()) as {
-          receive?: Record<
-            string,
-            { min_amount?: string | number; max_amount?: string | number }
-          >;
+      if (!infoOutcome.ok) {
+        return {
+          name: "sep31.info.asset",
+          passed: false,
+          code: "PRESETTLE_ANCHOR_DRIFT",
+          detail: `SEP-31 /info check failed: ${infoOutcome.error.message}`,
+          durationMs: Date.now() - start,
         };
-        const assetObj = j.receive?.[corridor.dest.asset];
-        if (assetObj) {
-          infoMin =
-            typeof assetObj.min_amount === "number"
-              ? String(assetObj.min_amount)
-              : assetObj.min_amount;
-          infoMax =
-            typeof assetObj.max_amount === "number"
-              ? String(assetObj.max_amount)
-              : assetObj.max_amount;
-        }
-      } catch (err) {
-        return toError(
-          `failed fetching /info: ${(err as Error).message}`,
-          "SETTLEMENT_FAILED",
-        );
       }
 
-      const manMin = corridor.limits?.min_amount;
-      let effectiveMin = manMin || infoMin;
-      if (manMin && infoMin) {
-        const cmp = compareAmounts(manMin, infoMin);
-        effectiveMin = cmp.ok && cmp.value > 0 ? manMin : infoMin;
+      const info = infoOutcome.value;
+      const receiveKeys = Object.keys(info.receive);
+      if (receiveKeys.length === 0) {
+        return {
+          name: "sep31.info.asset",
+          passed: false,
+          code: "PRESETTLE_ANCHOR_DRIFT",
+          detail: "SEP-31 /info receive list is empty",
+          durationMs: Date.now() - start,
+          info,
+        };
       }
 
-      if (effectiveMin) {
-        const cmp = compareAmounts(amount, effectiveMin);
-        if (cmp.ok && cmp.value < 0) {
-          return toError(`amount ${amount} is below minimum ${effectiveMin}`);
-        }
+      const assetInfo = info.receive[bridgeAsset];
+      if (!assetInfo) {
+        return {
+          name: "sep31.info.asset",
+          passed: false,
+          code: "PRESETTLE_ANCHOR_DRIFT",
+          detail: `SEP-31 /info does not list bridge asset "${bridgeAsset}" (lists: ${receiveKeys.join(", ")})`,
+          durationMs: Date.now() - start,
+          info,
+        };
       }
 
-      const manMax = corridor.limits?.max_amount;
-      let effectiveMax = manMax || infoMax;
-      if (manMax && infoMax) {
-        const cmp = compareAmounts(manMax, infoMax);
-        effectiveMax = cmp.ok && cmp.value < 0 ? manMax : infoMax;
-      }
-
-      if (effectiveMax) {
-        const cmp = compareAmounts(amount, effectiveMax);
-        if (cmp.ok && cmp.value > 0) {
-          return toError(`amount ${amount} exceeds maximum ${effectiveMax}`);
-        }
+      if (assetInfo.enabled === false) {
+        return {
+          name: "sep31.info.asset",
+          passed: false,
+          code: "PRESETTLE_ANCHOR_DRIFT",
+          detail: `SEP-31 /info lists bridge asset "${bridgeAsset}" as disabled (enabled: false)`,
+          durationMs: Date.now() - start,
+          info,
+        };
       }
 
       return {
-        name: "amount.range",
+        name: "sep31.info.asset",
         passed: true,
-        detail: "amount is within limits",
+        detail: `SEP-31 /info lists active bridge asset "${bridgeAsset}" (enabled: ${assetInfo.enabled ?? true})`,
         durationMs: Date.now() - start,
+        info,
       };
     },
   };
 }
+
+export {
+  openedTxCheck,
+  type OpenedTxCheckOptions,
+  type ReportedTransactionFields,
+} from "./openedTxCheck";
