@@ -7,6 +7,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ## [Unreleased]
 
+### Added — pre-settle amount range check (closes #155)
+
+- Added `amountRangeCheck` to `@corridor/sep31`. This pre-settle gate check ensures the amount actually sent falls within the anchor's `/info` bounds and the manifest's `limits` (using `max(manifest.min, info.min)` and `min(manifest.max, info.max)`). If bounds are exceeded, settlement fails with `PRESETTLE_AMOUNT_OUT_OF_RANGE`.
+- `execute()` now performs an early check against `limits.min_amount` before proceeding with the payment process.
+
 ### Added — verify the settle payment on-chain before reconcile
 
 - New optional `EngineDeps.chainVerifier`. After `settled` (and on resume from

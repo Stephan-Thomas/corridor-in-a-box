@@ -178,6 +178,18 @@ export async function execute(
     );
   }
 
+  const min = corridor.limits?.min_amount;
+  if (min) {
+    const cmp = compareAmounts(intent.sourceAmount.amount, min);
+    if (!cmp.ok) return cmp;
+    if (cmp.value < 0) {
+      return fail(
+        "AMOUNT_INVALID",
+        `sourceAmount "${intent.sourceAmount.amount}" is below corridor ${corridor.id} min_amount ${min}`,
+      );
+    }
+  }
+
   if (max) {
     const cmp = compareAmounts(intent.sourceAmount.amount, max);
     if (!cmp.ok) return cmp;

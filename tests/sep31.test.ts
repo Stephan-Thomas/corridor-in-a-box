@@ -7,6 +7,7 @@ import {
   receiverKycCheck,
   parseRefunds,
   sep31InfoCheck,
+  amountRangeCheck,
   type ReportedTransactionFields,
   type Sep10Signer,
   type Sep31InfoCheckResult,
@@ -1231,5 +1232,100 @@ describe("receiverKycCheck gate check (sep12.receiver)", () => {
     const evalFail = await gateFail.evaluate(testGateContext(cFail));
     expect(evalFail.passed).toBe(false);
     expect(evalFail.results[0].code).toBe("PRESETTLE_RECEIVER_NOT_ACCEPTED");
+  });
+});
+
+describe("amountRangeCheck gate check (sep31.amount.range)", () => {
+  function testGateContext(c: Corridor, customQuoteAmount = "100"): GateContext {
+    return {
+      intent,
+      corridor: c,
+      quote: {
+        id: "q-1",
+        price: "1",
+        expiresAt: Date.now() + 60_000,
+        sourceAmount: { asset: "USDC", amount: customQuoteAmount },
+        destAmount: { asset: "iso4217:ARS", amount: customQuoteAmount },
+        firm: true,
+      },
+      opened: {
+        transactionId: "tx-1",
+        depositAddress: "GDEPOSIT",
+      },
+      now: Date.now(),
+      attempt: 1,
+    };
+  }
+
+  it("has the name 'sep31.amount.range'", () => {
+    const c = corridor({ transfer_server_sep31: "https://d.example/sep31" });
+    const adapter = new Sep31Adapter(c, { fetchImpl: fakeFetch({}).fn });
+    const check = amountRangeCheck(adapter);
+    expect(check.name).toBe("sep31.amount.range");
+  });
+
+  it("passes when amount is within anchor info limits", async () => {
+    const c = corridor({ transfer_server_sep31: "https://d.example/sep31" });
+    const { fn } = fakeFetch({
+      "GET /sep31/info": res({
+        receive: { USDC: { min_amount: "50", max_amount: "500" } },
+      }),
+    });
+    const adapter = new Sep31Adapter(c, { fetchImpl: fn });
+    const check = amountRangeCheck(adapter);
+    const result = await check.run(testGateContext(c, "100"));
+
+    expect(result.passed).toBe(true);
+    expect(result.code).toBeUndefined();
+  });
+
+  it("anchor bumps sell_amount above max_amount, refused at verifying with zero submits", async () => {
+    const c = corridor({ transfer_server_sep31: "https://d.example/sep31" });
+    const { fn } = fakeFetch({
+      "GET /sep31/info": res({
+        receive: { USDC: { max_amount: "90" } },
+      }),
+    });
+    const adapter = new Sep31Adapter(c, { fetchImpl: fn });
+    const check = amountRangeCheck(adapter);
+    const result = await check.run(testGateContext(c, "100"));
+
+    expect(result.passed).toBe(false);
+    expect(result.code).toBe("PRESETTLE_AMOUNT_OUT_OF_RANGE");
+    expect(result.detail).toContain("above maximum 90");
+  });
+
+  it("below anchor min, above anchor max, and missing /info bounds so only manifest bounds apply", async () => {
+    const c = corridor(
+      { transfer_server_sep31: "https://d.example/sep31" },
+      { bridge_asset: "USDC" },
+    );
+    // Add manifest limits
+    c.limits = { min_amount: "20", max_amount: "200" };
+
+    // Missing info bounds
+    const { fn } = fakeFetch({
+      "GET /sep31/info": res({
+        receive: { USDC: {} },
+      }),
+    });
+    const adapter = new Sep31Adapter(c, { fetchImpl: fn });
+    const check = amountRangeCheck(adapter);
+
+    // Within manifest limits
+    const passResult = await check.run(testGateContext(c, "100"));
+    expect(passResult.passed).toBe(true);
+
+    // Below manifest min
+    const failMinResult = await check.run(testGateContext(c, "10"));
+    expect(failMinResult.passed).toBe(false);
+    expect(failMinResult.code).toBe("PRESETTLE_AMOUNT_OUT_OF_RANGE");
+    expect(failMinResult.detail).toContain("below minimum 20");
+
+    // Above manifest max
+    const failMaxResult = await check.run(testGateContext(c, "300"));
+    expect(failMaxResult.passed).toBe(false);
+    expect(failMaxResult.code).toBe("PRESETTLE_AMOUNT_OUT_OF_RANGE");
+    expect(failMaxResult.detail).toContain("above maximum 200");
   });
 });

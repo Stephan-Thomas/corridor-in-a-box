@@ -911,6 +911,7 @@ export function sep31InfoCheck(adapter: Sep31Adapter): GateCheck {
   };
 }
 
+export { amountRangeCheck } from "./amountRangeCheck";
 export {
   openedTxCheck,
   type OpenedTxCheckOptions,
