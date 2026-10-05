@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import { parseCorridor, type Corridor } from "@corridor/manifest";
 import { createMockAdapter } from "@corridor/adapter-kit";
 import { StaticRouteResolver } from "@corridor/router";
+import { amountRangeCheck } from "@corridor/sep31";
 import {
+  defaultSep31Gate,
   InMemoryAuditLog,
   InMemoryIdempotencyStore,
   InMemoryMetrics,
@@ -298,6 +300,46 @@ describe("engine pre-settle gate", () => {
     const gateCounters = metrics.counters.filter((c) => c.name === "corridor.gate.check");
     expect(gateCounters).toHaveLength(1);
     expect(gateCounters[0].tags).toEqual({ name: "chain.balance", passed: "false" });
+  });
+
+  it("refuses with PRESETTLE_AMOUNT_OUT_OF_RANGE and 0 submit calls when the quoted amount exceeds the anchor /info max", async () => {
+    let submitCalls = 0;
+    const submitter: SettlementSubmitter = {
+      async submit() {
+        submitCalls++;
+        return ok({ stellarTxHash: "tx-123", ledger: 100 });
+      },
+      async refund() {
+        return ok({ stellarTxHash: "refund-123", ledger: 101 });
+      },
+    };
+    const c = corridor();
+    let infoFetches = 0;
+    const infoAdapter = {
+      async getInfo() {
+        infoFetches++;
+        return ok({ receive: { [c.settlement.bridge_asset]: { maxAmount: "1" } } });
+      },
+    };
+
+    const d: EngineDeps = {
+      resolver: new StaticRouteResolver(() => createMockAdapter(), {
+        trustManifestWithoutAttestation: true,
+      }),
+      submitter,
+      gate: defaultSep31Gate({ checks: [amountRangeCheck(infoAdapter)] }),
+      idempotency: new InMemoryIdempotencyStore(),
+      trustManifestWithoutAttestation: true,
+    };
+
+    const r = await execute(intent("range-max"), c, d);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("PRESETTLE_AMOUNT_OUT_OF_RANGE");
+      expect(r.error.message).toContain("above maximum 1");
+    }
+    expect(submitCalls).toBe(0);
+    expect(infoFetches).toBe(1);
   });
 
   it("re-evaluates gate after retrying (attempt 1 fails submit, attempt 2 fails gate)", async () => {

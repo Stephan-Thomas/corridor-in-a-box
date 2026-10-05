@@ -17,7 +17,7 @@
 import { fileURLToPath } from "node:url";
 import { loadCorridor } from "@corridor/manifest";
 import { StaticRouteResolver } from "@corridor/router";
-import { Sep31Adapter } from "@corridor/sep31";
+import { Sep31Adapter, sep31GateChecks } from "@corridor/sep31";
 import {
   LocalKeypairSigner,
   StellarSep10Signer,
@@ -109,7 +109,7 @@ async function main(): Promise<void> {
     audit,
     logger: consoleLogger,
     trustManifestWithoutAttestation: true,
-    gate: defaultSep31Gate({ adapter, horizon: horizonUrl }),
+    gate: defaultSep31Gate({ adapter, horizon: horizonUrl, checks: sep31GateChecks(adapter) }),
   };
 
   // --- SEP-12 registration ------------------------------------------------

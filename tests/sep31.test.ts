@@ -8,11 +8,12 @@ import {
   parseRefunds,
   sep31InfoCheck,
   amountRangeCheck,
+  sep31GateChecks,
   type ReportedTransactionFields,
   type Sep10Signer,
   type Sep31InfoCheckResult,
 } from "@corridor/sep31";
-import type { PaymentIntent } from "@corridor/types";
+import { fail, ok, type PaymentIntent } from "@corridor/types";
 import { CompositeGate, type GateContext } from "@corridor/engine";
 import type { TransactionStatus } from "@corridor/adapter-kit";
 
@@ -1406,5 +1407,36 @@ describe("amountRangeCheck gate check (sep31.amount.range)", () => {
     expect(failMaxResult.passed).toBe(false);
     expect(failMaxResult.code).toBe("PRESETTLE_AMOUNT_OUT_OF_RANGE");
     expect(failMaxResult.detail).toContain("above maximum 200");
+  });
+  it("shares one /info fetch with sep31InfoCheck via sep31GateChecks", async () => {
+    const c = corridor({ transfer_server_sep31: "https://d.example/sep31" });
+    const { fn, calls } = fakeFetch({
+      "GET /sep31/info": res({ receive: { USDC: { min_amount: "50", max_amount: "500" } } }),
+    });
+    const adapter = new Sep31Adapter(c, { fetchImpl: fn });
+    const gate = new CompositeGate(sep31GateChecks(adapter));
+    const out = await gate.evaluate(testGateContext(c, "100"));
+    expect(out.passed).toBe(true);
+    expect(out.results.map((r) => r.name).sort()).toEqual([
+      "sep31.amount.range",
+      "sep31.info.asset",
+    ]);
+    expect(calls.filter((x) => x.url.endsWith("/sep31/info"))).toHaveLength(1);
+  });
+
+  it("fails (not silently passes) when /info cannot be fetched or bounds cannot be compared", async () => {
+    const c = corridor({ transfer_server_sep31: "https://d.example/sep31" });
+    const down = amountRangeCheck({
+      getInfo: async () => fail("ANCHOR_UNAVAILABLE", "down"),
+    });
+    const r1 = await down.run(testGateContext(c, "100"));
+    expect(r1.passed).toBe(false);
+
+    const bad = amountRangeCheck({
+      getInfo: async () => ok({ receive: { USDC: { maxAmount: "not-a-number" } } }),
+    });
+    const r2 = await bad.run(testGateContext(c, "100"));
+    expect(r2.passed).toBe(false);
+    expect(r2.code).toBe("PRESETTLE_AMOUNT_OUT_OF_RANGE");
   });
 });

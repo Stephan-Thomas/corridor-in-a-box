@@ -893,13 +893,13 @@ export interface Sep31InfoCheckResult extends CheckResult {
  * Gate check that verifies the receiving anchor's live SEP-31 /info still lists
  * and enables the corridor's bridge asset immediately before settlement.
  */
-export function sep31InfoCheck(adapter: Sep31Adapter): GateCheck {
+export function sep31InfoCheck(adapter: Sep31Adapter, infoSource?: InfoSource): GateCheck {
   return {
     name: "sep31.info.asset",
     async run(ctx: GateContext): Promise<Sep31InfoCheckResult> {
       const start = Date.now();
       const bridgeAsset = ctx.corridor.settlement.bridge_asset;
-      const infoOutcome = await adapter.getInfo();
+      const infoOutcome = await (infoSource ? infoSource(ctx) : adapter.getInfo());
 
       if (!infoOutcome.ok) {
         return {
@@ -958,7 +958,22 @@ export function sep31InfoCheck(adapter: Sep31Adapter): GateCheck {
   };
 }
 
-export { amountRangeCheck } from "./amountRangeCheck";
+import { amountRangeCheck, sharedInfoSource, type InfoSource } from "./amountRangeCheck";
+export {
+  amountRangeCheck,
+  sharedInfoSource,
+  type InfoSource,
+  type InfoAdapterLike,
+} from "./amountRangeCheck";
+
+/**
+ * The standard SEP-31 gate checks (/info asset listing and amount range),
+ * sharing a single /info fetch per gate run. Pass to `defaultSep31Gate({ checks })`.
+ */
+export function sep31GateChecks(adapter: Sep31Adapter): GateCheck[] {
+  const info = sharedInfoSource(adapter);
+  return [sep31InfoCheck(adapter, info), amountRangeCheck(adapter, info)];
+}
 export {
   openedTxCheck,
   type OpenedTxCheckOptions,
