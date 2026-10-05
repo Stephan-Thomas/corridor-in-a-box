@@ -44,6 +44,7 @@ import {
   InMemoryAuditLog,
   InMemoryIdempotencyStore,
   consoleLogger,
+  defaultSep31Gate,
   execute,
   type EngineDeps,
 } from "@corridor/engine";
@@ -205,6 +206,7 @@ async function main(): Promise<void> {
     audit,
     logger: consoleLogger,
     trustManifestWithoutAttestation: true,
+    gate: defaultSep31Gate({ adapter, horizon: HORIZON }),
   };
 
   // SEP-12 identifies both parties to the receiving anchor. The sending side

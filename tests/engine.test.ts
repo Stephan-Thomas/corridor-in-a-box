@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { parseCorridor, type Corridor } from "@corridor/manifest";
 import { createMockAdapter } from "@corridor/adapter-kit";
 import { StaticRouteResolver } from "@corridor/router";
@@ -9,12 +9,15 @@ import {
   hasRequestedRefund,
   canTransition,
   createMockSubmitter,
+  StellarPaymentStrategy,
   execute,
   reconcileUntil,
   type CorridorState,
   type EngineDeps,
   type PreSettleGate,
   type SettlementSubmitter,
+  type SettlementStrategy,
+  type StoredRun,
 } from "@corridor/engine";
 import type { TransactionStatus } from "@corridor/adapter-kit";
 import { fail, ok, type Outcome, type PaymentIntent } from "@corridor/types";
@@ -66,6 +69,7 @@ function deps(adapterOpts = {}, trustManifestWithoutAttestation = true): EngineD
     submitter: createMockSubmitter(),
     idempotency: new InMemoryIdempotencyStore(),
     trustManifestWithoutAttestation,
+    unsafeSkipPreSettleGate: true,
   };
 }
 
@@ -130,6 +134,7 @@ describe("engine.execute", () => {
       now,
       sleep,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     });
 
     expect(r.ok).toBe(false);
@@ -159,6 +164,7 @@ describe("engine.execute", () => {
       submitter,
       idempotency: store,
       audit,
+      unsafeSkipPreSettleGate: true,
       // No trustManifestWithoutAttestation on deps or opts
     };
 
@@ -227,6 +233,7 @@ describe("engine.execute", () => {
       submitter,
       idempotency: new InMemoryIdempotencyStore(),
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
 
     const r = await execute(intent("existing-settle"), corridor(), d);
@@ -494,6 +501,148 @@ describe("engine pre-settle gate", () => {
   });
 });
 
+function resumableRun(state: CorridorState, key = "resume-state"): StoredRun {
+  return {
+    idempotencyKey: key,
+    corridorId: "test",
+    state,
+    version: 4,
+    transactionId: "tx_resume",
+    quoteId: "q_resume",
+    quoteExpiresAt: Date.now() + 60_000,
+    quoteFirm: true,
+    settlementAmount: "100.00",
+    depositAddress: "GMOCK000000000000000000000000000000000000000000000000",
+    memo: "mock-memo",
+    memoType: "text",
+    stellarTxHash: "mocktx_existing",
+  };
+}
+
+describe("engine crash resume states", () => {
+  it.each(["created", "quoted", "compliant"] as const)(
+    "%s is failed as stale before anything is sent",
+    async (state) => {
+      const store = new InMemoryIdempotencyStore();
+      const key = `resume-${state}`;
+      await store.put({ ...resumableRun(state, key), transactionId: undefined });
+      const r = await execute(intent(key), corridor(), { ...deps(), idempotency: store });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.message).toContain("RESUME_STALE");
+      expect((await store.get(key))?.state).toBe("failed");
+    },
+  );
+
+  it.each(["opened", "retrying"] as const)(
+    "%s settles after a lookup miss and a fresh compliance gate",
+    async (state) => {
+      const store = new InMemoryIdempotencyStore();
+      const key = `resume-${state}-miss`;
+      await store.put(resumableRun(state, key));
+      const r = await execute(intent(key), corridor(), { ...deps(), idempotency: store });
+      expect(r.ok).toBe(true);
+      expect((await store.get(key))?.state).toBe("completed");
+    },
+  );
+
+  it.each(["opened", "retrying", "settling"] as const)(
+    "%s advances to settled when lookup proves the payment exists",
+    async (state) => {
+      const store = new InMemoryIdempotencyStore();
+      const key = `resume-${state}-hit`;
+      const submitter = createMockSubmitter();
+      const existingPayment = await submitter.submit({
+        to: "GMOCK000000000000000000000000000000000000000000000000",
+        memo: "mock-memo",
+        memoType: "text",
+        amount: { asset: "USDC", amount: "100.00" },
+        corridor: corridor(),
+      });
+      if (!existingPayment.ok) throw new Error("mock settlement did not succeed");
+      await store.put({ ...resumableRun(state, key), stellarTxHash: undefined });
+      const r = await execute(intent(key), corridor(), {
+        ...deps(),
+        idempotency: store,
+        submitter,
+      });
+      expect(r.ok).toBe(true);
+      expect((await store.get(key))?.state).toBe("completed");
+      expect((await store.get(key))?.stellarTxHash).toBe(existingPayment.value.stellarTxHash);
+    },
+  );
+
+  it("keeps a settling miss conflicted for operator review", async () => {
+    const store = new InMemoryIdempotencyStore();
+    const key = "resume-settling-miss";
+    await store.put(resumableRun("settling", key));
+    const r = await execute(intent(key), corridor(), { ...deps(), idempotency: store });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe("IDEMPOTENCY_CONFLICT");
+    expect((await store.get(key))?.state).toBe("settling");
+  });
+
+  it("reconciles a settled run and completes a reconciled run", async () => {
+    for (const state of ["settled", "reconciled"] as const) {
+      const store = new InMemoryIdempotencyStore();
+      const key = `resume-${state}`;
+      await store.put(resumableRun(state, key));
+      const r = await execute(intent(key), corridor(), { ...deps(), idempotency: store });
+      expect(r.ok).toBe(true);
+      expect((await store.get(key))?.state).toBe("completed");
+    }
+  });
+
+  it.each(["recovering", "refund_pending"] as const)(
+    "%s continues watching until the receiving anchor reports refund information",
+    async (state) => {
+      const refundStatus = {
+        amountRefunded: { asset: "USDC", amount: "100.00" },
+        amountFee: { asset: "USDC", amount: "0" },
+        payments: [],
+        completeness: "full" as const,
+      };
+      const store = new InMemoryIdempotencyStore();
+      const key = `resume-${state}`;
+      await store.put(resumableRun(state, key));
+      const r = await execute(intent(key), corridor(), {
+        ...deps({ terminalFailure: true, refundStatus }),
+        idempotency: store,
+      });
+      expect(r.ok).toBe(false);
+      expect((await store.get(key))?.state).toBe("refunded");
+    },
+  );
+
+  it("routes a resumed reconcile failure through recovery.rollback", async () => {
+    const store = new InMemoryIdempotencyStore();
+    const key = "resume-settled-refund";
+    await store.put(resumableRun("settled", key));
+    const refundStatus = {
+      amountRefunded: { asset: "USDC", amount: "100.00" },
+      amountFee: { asset: "USDC", amount: "0.00" },
+      payments: [
+        {
+          id: "refund-1",
+          amount: { asset: "USDC", amount: "100.00" },
+          fee: { asset: "USDC", amount: "0.00" },
+        },
+      ],
+      completeness: "full" as const,
+    };
+    const r = await execute(
+      intent(key),
+      corridorWith({ max_retries: 0, rollback: "refund_sender" }),
+      {
+        ...deps({ terminalFailure: true, refundStatus }),
+        idempotency: store,
+      },
+    );
+    expect(r.ok).toBe(false);
+    expect((await store.get(key))?.state).toBe("refunded");
+    expect((await store.get(key))?.refundId).toBeTruthy();
+  });
+});
+
 // Helper: build a corridor with custom recovery policy / timeout.
 function corridorWith(recovery: Record<string, unknown>): Corridor {
   const r = parseCorridor({
@@ -534,6 +683,7 @@ describe("engine recovery", () => {
       idempotency: new InMemoryIdempotencyStore(),
       sleep: async () => {},
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
     const r = await execute(
       intent(),
@@ -566,6 +716,7 @@ describe("engine recovery", () => {
       },
       reconcilePollMs: 500,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
     const r = await execute(
       intent(),
@@ -782,6 +933,7 @@ describe("engine recovery", () => {
       },
       reconcilePollMs: 500,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
     const r = await execute(
       intent("awaiting-input"),
@@ -815,6 +967,7 @@ describe("engine recovery", () => {
       },
       reconcilePollMs: 500,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
     const i = intent();
     await execute(
@@ -854,6 +1007,7 @@ describe("engine recovery", () => {
       },
       reconcilePollMs: 500,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     });
     const c = corridorWith({ max_retries: 0, timeout_seconds: 1, rollback: "refund_sender" });
     const i = intent();
@@ -916,6 +1070,7 @@ describe("engine recovery", () => {
       // would still pass on the error code — so assert it polled only once.
       reconcilePollMs: 500,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
     const r = await execute(
       intent("terminal-1"),
@@ -958,6 +1113,7 @@ describe("engine recovery", () => {
       },
       reconcilePollMs: 500,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
     const store = d.idempotency!;
     const r = await execute(
@@ -980,6 +1136,7 @@ describe("engine recovery", () => {
       idempotency: new InMemoryIdempotencyStore(),
       sleep: async () => {},
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
     const store = d.idempotency!;
     const r = await execute(
@@ -1165,6 +1322,7 @@ describe("state machine", () => {
       },
       reconcilePollMs: 500,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
     const r = await execute(
       intent("refund-watch-full"),
@@ -1200,6 +1358,7 @@ describe("state machine", () => {
       submitter: createMockSubmitter(),
       idempotency: store,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
     await execute(
       intent("refund-watch-partial"),
@@ -1226,6 +1385,7 @@ describe("state machine", () => {
       },
       reconcilePollMs: 500,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
     await execute(
       intent("refund-watch-timeout"),
@@ -1304,6 +1464,7 @@ function refundHarness(
       },
       reconcilePollMs: 500,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     },
   };
 }
@@ -1456,6 +1617,7 @@ describe("per-corridor reconcile config", () => {
       reconcilePollMs: 7,
       stallThreshold: 10,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
     return { d, store };
   }
@@ -1631,6 +1793,7 @@ describe("Quote fee and settlement amount validation", () => {
       },
       idempotency: store,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
 
     const r = await execute(intent("invalid-dp-quote"), corridor(), deps);
@@ -1679,6 +1842,7 @@ describe("Quote fee and settlement amount validation", () => {
       idempotency: store,
       audit,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
 
     const r = await execute(intent("audit-fee-key"), corridor(), deps);
@@ -1767,5 +1931,255 @@ describe("engine chain verifier", () => {
     expect(got).toBe("GDEST");
     expect(r.ok).toBe(false);
     expect((await h.store.get("cv-resume"))?.state).toBe("held");
+  });
+});
+
+describe("pre-settle gate enforcement", () => {
+  it("fails fast with ENGINE_MISCONFIGURED and creates no run record when neither gate nor opt-out is provided", async () => {
+    const store = new InMemoryIdempotencyStore();
+    const r = await execute(intent("no-gate"), corridor(), {
+      resolver: new StaticRouteResolver(() => createMockAdapter(), {
+        trustManifestWithoutAttestation: true,
+      }),
+      submitter: createMockSubmitter(),
+      idempotency: store,
+      trustManifestWithoutAttestation: true,
+    });
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("ENGINE_MISCONFIGURED");
+      expect(r.error.retryable).toBe(false);
+    }
+    // Verify no run was persisted in the store
+    const stored = await store.get("no-gate");
+    expect(stored).toBeUndefined();
+  });
+
+  it("records gate.skipped check and logs a warning when unsafeSkipPreSettleGate is enabled", async () => {
+    const audit = new InMemoryAuditLog();
+    const warnings: string[] = [];
+    const r = await execute(intent("skipped-gate"), corridor(), {
+      resolver: new StaticRouteResolver(() => createMockAdapter(), {
+        trustManifestWithoutAttestation: true,
+      }),
+      submitter: createMockSubmitter(),
+      idempotency: new InMemoryIdempotencyStore(),
+      trustManifestWithoutAttestation: true,
+      audit,
+      unsafeSkipPreSettleGate: true,
+      logger: {
+        log(level, msg) {
+          if (level === "warn") warnings.push(msg);
+        },
+      },
+    });
+
+    expect(r.ok).toBe(true);
+    expect(warnings.length).toBeGreaterThan(0);
+    expect(warnings[0]).toContain("unsafeSkipPreSettleGate");
+
+    const verifyingEntry = audit.entries.find((e) => e.to === "verifying");
+    expect(verifyingEntry).toBeDefined();
+    expect(verifyingEntry?.checks).toBeDefined();
+    expect(verifyingEntry?.checks?.[0]).toEqual({
+      name: "gate.skipped",
+      passed: true,
+      detail: "unsafeSkipPreSettleGate",
+      durationMs: 0,
+    });
+  });
+
+  it("fails in verifying state and does not call submitter.submit when a gate check fails", async () => {
+    let submitCalled = false;
+    const audit = new InMemoryAuditLog();
+    const store = new InMemoryIdempotencyStore();
+    const failingGate: PreSettleGate = {
+      evaluate: async () => ({
+        passed: false,
+        results: [
+          {
+            name: "test.check",
+            passed: false,
+            detail: "simulated gate failure",
+            code: "PRESETTLE_ANCHOR_DRIFT",
+            durationMs: 5,
+          },
+        ],
+      }),
+    };
+
+    const r = await execute(intent("failing-gate"), corridor(), {
+      resolver: new StaticRouteResolver(() => createMockAdapter(), {
+        trustManifestWithoutAttestation: true,
+      }),
+      submitter: {
+        submit: async () => {
+          submitCalled = true;
+          return fail("SETTLEMENT_FAILED", "should not be called", { retryable: false });
+        },
+        refund: async () => fail("SETTLEMENT_FAILED", "not reached", { retryable: false }),
+      },
+      idempotency: store,
+      trustManifestWithoutAttestation: true,
+      audit,
+      gate: failingGate,
+    });
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("PRESETTLE_ANCHOR_DRIFT");
+    }
+    expect(submitCalled).toBe(false);
+
+    const stored = await store.get("failing-gate");
+    expect(stored?.state).toBe("failed");
+    expect(stored?.lastError).toContain("PRESETTLE_ANCHOR_DRIFT");
+
+    const verifyingEntry = audit.entries.find((e) => e.to === "verifying");
+    expect(verifyingEntry?.checks).toHaveLength(1);
+    expect(verifyingEntry?.checks?.[0].passed).toBe(false);
+  });
+
+  it("re-evaluates gate after retry", async () => {
+    let gateEvaluations = 0;
+    let submitCalls = 0;
+    const dynamicGate: PreSettleGate = {
+      evaluate: async () => {
+        gateEvaluations++;
+        return {
+          passed: true,
+          results: [{ name: "gate.dynamic", passed: true, detail: "ok", durationMs: 1 }],
+        };
+      },
+    };
+
+    const submitter: SettlementSubmitter = {
+      submit: async () => {
+        submitCalls++;
+        if (submitCalls === 1) {
+          return fail("SETTLEMENT_FAILED", "transient failure", { retryable: true });
+        }
+        return ok({ stellarTxHash: "0xabc", anchorTxId: "tx-123" });
+      },
+      refund: async () => fail("SETTLEMENT_FAILED", "not reached", { retryable: false }),
+    };
+
+    const r = await execute(intent("gate-retry"), corridorWith({ max_retries: 2 }), {
+      resolver: new StaticRouteResolver(() => createMockAdapter(), {
+        trustManifestWithoutAttestation: true,
+      }),
+      submitter,
+      idempotency: new InMemoryIdempotencyStore(),
+      trustManifestWithoutAttestation: true,
+      gate: dynamicGate,
+      sleep: async () => {},
+    });
+
+    expect(r.ok).toBe(true);
+    expect(submitCalls).toBe(2);
+    // Gate was evaluated before first settle and re-evaluated before retry settle
+    expect(gateEvaluations).toBe(2);
+  });
+});
+
+describe("SettlementStrategy", () => {
+  // Helper: run a full payment through execute() with custom deps override.
+  async function run(depsOverride: Partial<EngineDeps> = {}) {
+    return execute(intent("strategy-test"), corridor(), {
+      ...deps(),
+      ...depsOverride,
+      idempotency: new InMemoryIdempotencyStore(),
+    });
+  }
+
+  it("StellarPaymentStrategy produces the same settling -> settled transition as the legacy submitter", async () => {
+    const submitter = createMockSubmitter();
+    const r = await run({
+      strategies: [new StellarPaymentStrategy(submitter)],
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.state).toBe("completed");
+      expect(r.value.trail).toContain("settling");
+      expect(r.value.trail).toContain("settled");
+      expect(r.value.stellarTxHash).toMatch(/^mocktx/);
+    }
+  });
+
+  it("strategy selected by kind: engine dispatches to the matching strategy", async () => {
+    // Spy to verify the correct strategy's settle() was called.
+    const spySettle = vi.fn().mockResolvedValue(
+      ok({
+        stellarTxHash: "spy000000000000000000000000000000000000000000000000000000000001",
+        ledger: 1,
+      }),
+    );
+    const strategy: SettlementStrategy = {
+      kind: "stellar_payment",
+      settle: spySettle,
+    };
+
+    const r = await run({ strategies: [strategy] });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.value.state).toBe("completed");
+    expect(spySettle).toHaveBeenCalledOnce();
+    // Context should carry the opened tx, quote, and corridor.
+    const ctx = spySettle.mock.calls[0][0];
+    expect(ctx).toHaveProperty("opened");
+    expect(ctx).toHaveProperty("quote");
+    expect(ctx).toHaveProperty("corridor");
+  });
+
+  it("unknown kind fails closed and never calls the submitter", async () => {
+    const submitter = createMockSubmitter();
+    const submitSpy = vi.spyOn(submitter, "submit");
+
+    // Create an adapter that returns a deposit instruction kind not in our
+    // strategies list, simulating a future kind from issue #183.
+    const mockAdapter = createMockAdapter();
+    const originalOpen = mockAdapter.openTransaction.bind(mockAdapter);
+    mockAdapter.openTransaction = async (intent, quote, corridor) => {
+      const r = await originalOpen(intent, quote, corridor);
+      if (!r.ok) return r;
+      // Inject a `kind` field onto the opened tx to simulate claimable_balance.
+      return ok({ ...r.value, kind: "claimable_balance" });
+    };
+
+    const resolver = new StaticRouteResolver(() => mockAdapter, {
+      trustManifestWithoutAttestation: true,
+    });
+
+    // Only register a stellar_payment strategy — no match for claimable_balance.
+    const r = await run({
+      resolver,
+      submitter,
+      strategies: [new StellarPaymentStrategy(submitter)],
+    });
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("SETTLEMENT_FAILED");
+      // The error message must name the unrecognised kind.
+      expect(r.error.message).toMatch(/claimable_balance/);
+    }
+    // The underlying submitter must not have been called — no money moved.
+    expect(submitSpy).not.toHaveBeenCalled();
+  });
+
+  it("settling -> settled transitions are unchanged when using strategies", async () => {
+    const audit = new InMemoryAuditLog();
+    const r = await run({
+      strategies: [new StellarPaymentStrategy(createMockSubmitter())],
+    });
+    void audit;
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      const trail = r.value.trail;
+      const settlingIdx = trail.indexOf("settling");
+      const settledIdx = trail.indexOf("settled");
+      expect(settlingIdx).toBeGreaterThan(-1);
+      expect(settledIdx).toBe(settlingIdx + 1);
+    }
   });
 });

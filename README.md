@@ -317,6 +317,9 @@ Swap the mocks for the real implementations (both ship in this repo):
   durable, crash-resumable run log (run `migrate(pool)` once at startup).
 - Pass an `audit` sink (and a `logger`) to `execute()` so every state transition
   is recorded.
+- Provide `gate: defaultSep31Gate(...)` (or a custom `PreSettleGate`) to `execute()`.
+  Pre-settle safety checks are mandatory by default before money moves on chain
+  (`unsafeSkipPreSettleGate: true` is strictly an explicit opt-out for tests).
 
 Then point a manifest at the testnet reference server and run it for real. The
 open repo runs with its default `RouteResolver`; a proprietary implementation

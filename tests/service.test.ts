@@ -61,6 +61,7 @@ function deps(adapterOpts = {}): EngineDeps {
     idempotency: new InMemoryIdempotencyStore(),
     sleep: async () => {},
     trustManifestWithoutAttestation: true,
+    unsafeSkipPreSettleGate: true,
   };
 }
 

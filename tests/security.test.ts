@@ -71,6 +71,7 @@ function service(opts: {
       idempotency: opts.store ?? new InMemoryIdempotencyStore(),
       submitter: opts.submitter ?? recordingSubmitter().submitter,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     },
   });
 }

@@ -59,6 +59,7 @@ function deps(metrics: InMemoryMetrics, adapterOpts = {}): EngineDeps {
     metrics,
     sleep: async () => {},
     trustManifestWithoutAttestation: true,
+    unsafeSkipPreSettleGate: true,
   };
 }
 

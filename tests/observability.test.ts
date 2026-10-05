@@ -62,6 +62,7 @@ describe("audit trail", () => {
       audit,
       now: () => 1700000000000,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
     const r = await execute(intent, corridor(), deps);
     expect(r.ok).toBe(true);
@@ -101,6 +102,7 @@ describe("audit trail", () => {
       idempotency: new InMemoryIdempotencyStore(),
       audit,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
     const r = await execute(intent, corridor(), deps);
     expect(r.ok).toBe(false);
@@ -229,6 +231,7 @@ describe("reconcile polling observability", () => {
       logger,
       metrics,
       trustManifestWithoutAttestation: true,
+      unsafeSkipPreSettleGate: true,
     };
 
     const r = await execute(intent, corridor(), deps);

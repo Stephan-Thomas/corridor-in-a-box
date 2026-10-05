@@ -28,6 +28,7 @@ import {
   InMemoryIdempotencyStore,
   PostgresIdempotencyStore,
   consoleLogger,
+  defaultSep31Gate,
   execute,
   migrate,
   type EngineDeps,
@@ -108,6 +109,7 @@ async function main(): Promise<void> {
     audit,
     logger: consoleLogger,
     trustManifestWithoutAttestation: true,
+    gate: defaultSep31Gate({ adapter, horizon: horizonUrl }),
   };
 
   // --- SEP-12 registration ------------------------------------------------

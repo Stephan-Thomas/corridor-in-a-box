@@ -6,6 +6,7 @@
 import type { Money } from "@corridor/types";
 import type { CorridorState } from "./state";
 import type { LivenessState } from "@corridor/manifest";
+import type { CheckResult } from "./gate";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -47,6 +48,8 @@ export interface AuditEntry extends LogFields {
   readonly networkFee?: string;
   readonly amountRefunded?: string;
   readonly amountFee?: string;
+  /** Pre-settle gate results, recorded on the `verifying` transition. */
+  readonly checks?: readonly CheckResult[];
 }
 
 /** Verification decision recorded before the engine claims an idempotency key. */
